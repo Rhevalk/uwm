@@ -1,10 +1,10 @@
 PREFIX = /usr
 CFLAGS = -Os -Wall -ffunction-sections -fdata-sections
 LDFLAGS = -Wl,--gc-sections
-LIBS = -lxcb -lxcb-keysyms
+LIBS = -lxcb -lxcb-keysyms -lxcb-icccm
 
 all:
-	$(CC) $(CFLAGS) uwm.c $(LDFLAGS) $(LIBS) -o uwm
+	cc $(CFLAGS) uwm.c $(LIBS) -o uwm
 	strip --strip-all uwm
 
 clean:

@@ -1,0 +1,337 @@
+#include <xcb/xcb.h>
+#include <xcb/xcb_keysyms.h>
+#include <X11/keysym.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+
+#define CLEANMASK(mask) (mask & ~(XCB_MOD_MASK_LOCK | XCB_MOD_MASK_2))
+
+typedef union {
+    int i;
+    const char **v;
+} Arg;
+
+typedef struct {
+    uint32_t mod;
+    xcb_keysym_t keysym;
+    void (*func)(const Arg *);
+    const Arg arg;
+    xcb_keycode_t code;
+} Key;
+
+static void spawn(const Arg *);
+static void view(const Arg *);
+static void move_focused_to_ws(const Arg *arg);
+static void killclient(const Arg *);
+static void swap_lr(const Arg *);
+static void setup_keys();
+static void logout(const Arg *arg);
+
+#include "config.h"
+
+/* ---------- GLOBAL ---------- */
+static xcb_connection_t *conn;
+static xcb_screen_t *scr;
+
+/* workspace: 2 tiled + floating list */
+static xcb_window_t ws[WORKSPACES][2] = {{0}};
+static xcb_window_t floating[WORKSPACES][32] = {{0}};
+static int float_count[WORKSPACES] = {0};
+
+static int cur = 0;
+static int focus_idx = 0;
+
+/* ---------- KEYSETUP ---------- */
+static void setup_keys() {
+    xcb_key_symbols_t *syms = xcb_key_symbols_alloc(conn);
+
+    for (unsigned int i = 0; i < sizeof(keys)/sizeof(Key); i++) {
+        xcb_keycode_t *kc = xcb_key_symbols_get_keycode(syms, keys[i].keysym);
+        if (!kc) continue;
+
+        for (int j = 0; kc[j] != XCB_NO_SYMBOL; j++) {
+            xcb_grab_key(conn, 1, scr->root,
+                         keys[i].mod, kc[j],
+                         XCB_GRAB_MODE_ASYNC,
+                         XCB_GRAB_MODE_ASYNC);
+        }
+
+        keys[i].code = kc[0];
+        free(kc);
+    }
+
+    xcb_key_symbols_free(syms);
+}
+
+/* ---------- SPAWN ---------- */
+static void spawn(const Arg *arg) {
+    if (fork() == 0) {
+        if (conn) close(xcb_get_file_descriptor(conn));
+        setsid();
+        execvp(((char **)arg->v)[0], (char **)arg->v);
+        _exit(1);
+    }
+}
+
+/* ---------- FOCUS ---------- */
+static void focus_window(xcb_window_t win) {
+    if (win)
+        xcb_set_input_focus(conn, XCB_INPUT_FOCUS_POINTER_ROOT, win, XCB_CURRENT_TIME);
+}
+
+/* ---------- TILE LAYOUT ---------- */
+static void tile_two(xcb_window_t w0, xcb_window_t w1) {
+    if (w0 && !w1) {
+        uint32_t v[] = {0, 0, scr->width_in_pixels, scr->height_in_pixels};
+        xcb_configure_window(conn, w0,
+            XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+            XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+            v);
+        return;
+    }
+
+    if (!w0) return;
+
+    uint32_t half = scr->width_in_pixels / 2;
+
+    uint32_t v0[] = {0, 0, half, scr->height_in_pixels};
+    xcb_configure_window(conn, w0,
+        XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+        XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+        v0);
+
+    if (w1) {
+        uint32_t v1[] = {half, 0, scr->width_in_pixels - half, scr->height_in_pixels};
+        xcb_configure_window(conn, w1,
+            XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+            XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+            v1);
+    }
+}
+
+/* ---------- helper ---------- */
+static void fix_focus() {
+    if (ws[cur][0] == 0 && ws[cur][1] != 0) focus_idx = 1;
+    else focus_idx = 0;
+}
+
+static void refresh_ws(int n) {
+    if (cur != n) return;
+
+    tile_two(ws[cur][0], ws[cur][1]);
+
+    for (int i = 0; i < float_count[cur]; i++) {
+        if (floating[cur][i])
+            xcb_map_window(conn, floating[cur][i]);
+    }
+
+    focus_window(ws[cur][focus_idx]);
+}
+
+/* ---------- ARRANGE ---------- */
+static void arrange() {
+    tile_two(ws[cur][0], ws[cur][1]);
+
+    for (int i = 0; i < float_count[cur]; i++) {
+        if (floating[cur][i])
+            xcb_map_window(conn, floating[cur][i]);
+    }
+
+    focus_window(ws[cur][focus_idx]);
+}
+
+/* ---------- VIEW ---------- */
+static void view(const Arg *arg) {
+    int n = arg->i;
+    if (n < 0 || n >= WORKSPACES || n == cur) return;
+
+    /* hide old */
+    for (int i = 0; i < 2; i++)
+        if (ws[cur][i])
+            xcb_unmap_window(conn, ws[cur][i]);
+
+    for (int i = 0; i < float_count[cur]; i++)
+        if (floating[cur][i])
+            xcb_unmap_window(conn, floating[cur][i]);
+
+    cur = n;
+
+    /* show new */
+    for (int i = 0; i < 2; i++)
+        if (ws[cur][i])
+            xcb_map_window(conn, ws[cur][i]);
+
+    for (int i = 0; i < float_count[cur]; i++)
+        if (floating[cur][i])
+            xcb_map_window(conn, floating[cur][i]);
+
+    fix_focus();
+    arrange();
+    xcb_flush(conn);
+}
+
+/* ---------- MOVE WINDOW ---------- */
+static void move_focused_to_ws(const Arg *arg) {
+    int target = arg->i;
+    if (target < 0 || target >= WORKSPACES || target == cur) return;
+
+    xcb_window_t win = ws[cur][focus_idx];
+    if (!win) return;
+
+    /* ---------- remove from current ---------- */
+    if (ws[cur][0] == win) {
+        ws[cur][0] = ws[cur][1];
+        ws[cur][1] = 0;
+    } else if (ws[cur][1] == win) {
+        ws[cur][1] = 0;
+    }
+
+    for (int i = 0; i < float_count[cur]; i++) {
+        if (floating[cur][i] == win) {
+            floating[cur][i] = 0;
+            break;
+        }
+    }
+
+    fix_focus();
+
+    /* ---------- insert to target ---------- */
+    if (!ws[target][0]) {
+        ws[target][0] = win;
+    } else if (!ws[target][1]) {
+        ws[target][1] = win;
+    } else {
+        floating[target][float_count[target]++] = win;
+    }
+
+    /* IMPORTANT: only refresh current view */
+    arrange();
+    xcb_flush(conn);
+}
+
+/* ---------- KILL ---------- */
+static void killclient(const Arg *arg) {
+    xcb_window_t win = ws[cur][focus_idx];
+
+    if (win) {
+        xcb_kill_client(conn, win);
+
+        if (ws[cur][0] == win) ws[cur][0] = ws[cur][1];
+        ws[cur][1] = 0;
+
+        fix_focus();
+        arrange();
+        return;
+    }
+
+    for (int i = 0; i < float_count[cur]; i++) {
+        if (floating[cur][i]) {
+            xcb_kill_client(conn, floating[cur][i]);
+            floating[cur][i] = 0;
+            break;
+        }
+    }
+
+    arrange();
+}
+
+/* ---------- SWAP FOCUS ---------- */
+static void swap_lr(const Arg *arg) {
+    if (ws[cur][1]) {
+        focus_idx ^= 1;
+        focus_window(ws[cur][focus_idx]);
+    }
+}
+
+/* ---------- MAP REQUEST ---------- */
+static void handle_map(xcb_window_t win) {
+    if (!ws[cur][0]) {
+        ws[cur][0] = win;
+    } else if (!ws[cur][1]) {
+        ws[cur][1] = win;
+    } else {
+        floating[cur][float_count[cur]++] = win;
+    }
+
+    xcb_map_window(conn, win);
+    fix_focus();
+    arrange();
+    focus_window(win);
+}
+/* ---------- LOGOUT ---------- */
+static void logout(const Arg *arg) {
+    if (conn) xcb_disconnect(conn);
+    exit(0);
+}
+
+/* ---------- MAIN ---------- */
+int main(void) {
+    conn = xcb_connect(NULL, NULL);
+    if (xcb_connection_has_error(conn)) return 1;
+
+    scr = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
+
+    signal(SIGCHLD, SIG_IGN);
+
+    uint32_t values[] = {
+        XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
+        XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY
+    };
+
+    xcb_change_window_attributes(conn, scr->root,
+        XCB_CW_EVENT_MASK, values);
+
+    setup_keys();
+    xcb_flush(conn);
+
+    xcb_generic_event_t *ev;
+
+    while ((ev = xcb_wait_for_event(conn))) {
+        switch (ev->response_type & ~0x80) {
+
+        case XCB_MAP_REQUEST: {
+            xcb_map_request_event_t *e = (xcb_map_request_event_t *)ev;
+            handle_map(e->window);
+            break;
+        }
+
+        case XCB_KEY_PRESS: {
+            xcb_key_press_event_t *e = (xcb_key_press_event_t *)ev;
+
+            for (unsigned int i = 0; i < sizeof(keys)/sizeof(Key); i++) {
+                if (e->detail == keys[i].code &&
+                    CLEANMASK(e->state) == CLEANMASK(keys[i].mod)) {
+                    keys[i].func(&(keys[i].arg));
+                    break;
+                }
+            }
+            break;
+        }
+
+        case XCB_DESTROY_NOTIFY: {
+            xcb_destroy_notify_event_t *e = (xcb_destroy_notify_event_t *)ev;
+
+            for (int i = 0; i < WORKSPACES; i++) {
+                for (int j = 0; j < 2; j++) {
+                    if (ws[i][j] == e->window) ws[i][j] = 0;
+                }
+
+                for (int j = 0; j < float_count[i]; j++) {
+                    if (floating[i][j] == e->window)
+                        floating[i][j] = 0;
+                }
+
+                arrange();
+            }
+            break;
+        }
+        }
+
+        free(ev);
+        xcb_flush(conn);
+    }
+
+    xcb_disconnect(conn);
+    return 0;
+}
