@@ -1,5 +1,3 @@
-/* uwm -- v0.0.9 alpha Absolute-Purist Edition */
-
 #include <xcb/xcb.h>
 #include <xcb/xcb_keysyms.h>
 #include <unistd.h>
@@ -187,18 +185,12 @@ cmd_quit(const Arg *arg) { (void)arg;
 
 static void 
 handle_map_request(xcb_generic_event_t *ev) {
-    xcb_map_request_event_t *e = (xcb_map_request_event_t *)ev;
     if (CWS.map == 0xFF) return;
 
-    xcb_get_window_attributes_reply_t *wa = xcb_get_window_attributes_reply(conn, xcb_get_window_attributes(conn, e->window), NULL);
-
-    if (wa && wa->override_redirect) { free(wa); xcb_map_window(conn, e->window); xcb_flush(conn); return; }
-    if (wa) free(wa);
-
-    xcb_change_window_attributes(conn, e->window, 
-            XCB_CW_EVENT_MASK, (uint32_t[]){ 
-            XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY 
-            });
+    xcb_map_request_event_t *e = (xcb_map_request_event_t *)ev;
+    xcb_change_window_attributes(conn, e->window, XCB_CW_EVENT_MASK, (uint32_t[]){ 
+        XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY 
+    });
 
     u_move_resize(e->window, 0, 0, scr->width_in_pixels, scr->height_in_pixels);
 
