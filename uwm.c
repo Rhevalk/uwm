@@ -1,3 +1,5 @@
+/* uwm -- v0.0.9 alpha Absolute-Purist Edition */
+
 #include <xcb/xcb.h>
 #include <xcb/xcb_keysyms.h>
 #include <unistd.h>
@@ -11,6 +13,7 @@
 #define CLEANMASK(m)       ((m) & ~(XCB_MOD_MASK_LOCK | XCB_MOD_MASK_2))
 #define NELEMS(x)          (sizeof(x)/sizeof(x[0]))
 #define CWS                (workspaces[ws_current])
+#define CLAMP(v, min, max) ((v) < (min) ? (min) : ((v) > (max) ? (max) : (v)))
 
 typedef union { 
     const char **v; 
@@ -77,12 +80,9 @@ u_move_resize(xcb_window_t w, int32_t x, int32_t y, uint32_t ww, uint32_t wh) {
 static inline void 
 u_remove_and_refocus(xcb_window_t w) {
     int ws, idx;
-    if ((idx = u_find_client(w, &ws)) == -1) return;
-    
+    if ((idx = u_find_client(w, &ws)) == -1 || ws != ws_current) return;
     workspaces[ws].map &= ~(1 << idx); 
-    
-    if (ws == ws_current && focused == w) 
-        u_focus(workspaces[ws].map ? workspaces[ws].clients[__builtin_ctz(workspaces[ws].map)] : XCB_NONE);
+    if (focused == w) u_focus(workspaces[ws].map ? workspaces[ws].clients[__builtin_ctz(workspaces[ws].map)] : XCB_NONE);
 }
 
 static void 
@@ -152,22 +152,18 @@ static void
 cmd_snap(const Arg *arg) {
     if (focused == XCB_NONE) return;
     uint32_t sw = scr->width_in_pixels, sh = scr->height_in_pixels;
+    static uint8_t state = 0;
 
-    xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, focused), NULL);
-    if (!g) return;
+    // 1: Atas (4), 2: Bawah (8), 3: Kanan (2), 4: Kiri (1)
+    if (arg->i == 4) state = (state & 2) ? (state & ~2) : (state | 1); // Kiri: lepas kanan, baru pasang kiri
+    if (arg->i == 3) state = (state & 1) ? (state & ~1) : (state | 2); // Kanan: lepas kiri, baru pasang kanan
+    if (arg->i == 1) state = (state & 8) ? (state & ~8) : (state | 4); // Atas: lepas bawah, baru pasang atas
+    if (arg->i == 2) state = (state & 4) ? (state & ~4) : (state | 8); // Bawah: lepas atas, baru pasang bawah
 
-    uint8_t state = ((g->x >= (int32_t)(sw >> 1)) << 1) | 
-                    ((g->width < sw) && (g->x == 0))    | 
-                    ((g->y >= (int32_t)(sh >> 1)) << 3) | 
-                    (((g->height < sh) && (g->y == 0)) << 2); 
-    free(g);
-
-    uint8_t set   = arg->i & 0xFF, clear = (arg->i >> 8) & 0xFF;
-    state = (state & clear) ? (state & ~clear) : (state | set);
-
+    // Hitung geometri kilat pakai bitwise shift murni (4 Byte / 1 Byte state)
     u_move_resize(focused, 
-        (state & 2)  ? (int32_t)(sw >> 1) : 0,  (state & 8)  ? (int32_t)(sh >> 1) : 0,
-        (state & 3)  ? (sw >> 1) : sw,          (state & 12) ? (sh >> 1) : sh
+        (state & 2)  ? (sw >> 1) : 0,  (state & 8)  ? (sh >> 1) : 0,
+        (state & 3)  ? (sw >> 1) : sw, (state & 12) ? (sh >> 1) : sh
     );
     xcb_flush(conn);
 }
@@ -194,25 +190,15 @@ handle_map_request(xcb_generic_event_t *ev) {
     if (CWS.map == 0xFF) return;
 
     xcb_map_request_event_t *e = (xcb_map_request_event_t *)ev;
-    xcb_change_window_attributes(conn, e->window, XCB_CW_EVENT_MASK, (uint32_t[]){ 
-        XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY 
-    });
+    xcb_change_window_attributes(conn, e->window, 
+            XCB_CW_EVENT_MASK, (uint32_t[]){ 
+            XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY 
+            });
 
     u_move_resize(e->window, 0, 0, scr->width_in_pixels, scr->height_in_pixels);
 
-    int i = __builtin_ctz(~CWS.map); 
-    CWS.clients[i] = e->window; 
-    CWS.map |= (1 << i);
-    
-    xcb_map_window(conn, e->window); 
-
-    if (focused == XCB_NONE) 
-        u_focus(e->window);
-    else
-        xcb_configure_window(conn, focused, XCB_CONFIG_WINDOW_STACK_MODE, 
-            (uint32_t[]){ XCB_STACK_MODE_ABOVE });
-    
-    xcb_flush(conn);
+    int i = __builtin_ctz(~CWS.map); CWS.clients[i] = e->window; CWS.map |= (1 << i);
+    xcb_map_window(conn, e->window); u_focus(e->window); xcb_flush(conn);
 }
 
 static void 
@@ -240,7 +226,9 @@ setup_main(void) {
     signal(SIGCHLD, SIG_IGN);
 
     if (xcb_request_check(conn, xcb_change_window_attributes_checked(conn, scr->root, 
-        XCB_CW_EVENT_MASK, (uint32_t[]){ XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY }))
+                    XCB_CW_EVENT_MASK, (uint32_t[]){ 
+                    XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | 
+                    XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY }))
         ) exit(1);
 
     xcb_intern_atom_cookie_t c1 = xcb_intern_atom(conn, 0, 12, "WM_PROTOCOLS"), c2 = xcb_intern_atom(conn, 0, 16, "WM_DELETE_WINDOW");
